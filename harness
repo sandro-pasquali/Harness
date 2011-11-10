@@ -1,0 +1,479 @@
+#!/usr/local/bin node
+
+//	Harness
+//
+//	A process manager for Node. Harnessing a Node has benefits:
+//
+//	1. 	If the harnessed program is changed the Node will be restarted (no need to
+//		manually restart after changes).
+//	2. 	V8 heap usage can be monitored and action can be taken.
+//	3.	Generally, decisions can be made based on the state of the child node, including
+//		passing instructions to the node.
+//
+
+const 	http 			= require('http');
+const 	path			= require('path');
+const 	util			= require('util');
+const 	fs 				= require('fs');
+const	sys 			= require('sys');
+const 	emitter			= require('events').EventEmitter;
+const 	childProcess	= require("child_process");
+const 	dgram 			= require("dgram");
+const	os				= require("os");
+
+const 	spawn		= childProcess.spawn;
+const	exec		= childProcess.exec;
+const 	resolve 	= path.resolve;
+const 	udpServer	= dgram.createSocket("udp4");
+const 	filename	= __filename.replace(__dirname + "/", "");
+
+const	version		= "0.0.1";
+
+//console.log(require.cache)
+
+//	The passed arguments
+//
+const 	args 			= process.argv.slice(2);
+
+//	The current working directory.
+//
+const	workingDir		= process.cwd();
+
+//	The file to harness, set in processing of arguments, below.
+//
+var harnessFile	= null;
+
+//	This will contain a reference to the main node process.
+//
+var	node;
+
+//	This contains the #mtime of #harnessFile as of last execution of #startNode, set in
+//	#startNode. #monitor will watch for a change in this value in the #mtime of
+//	#harnessFile, and restart the node when changes happen.
+//
+var lastTouch;
+
+/**********************************************************************************************/
+
+							// 	CLI argument defaults 	//
+
+/**********************************************************************************************/
+
+//	The "man page" for Harness.
+//
+var manPage = [
+	'----------------------------------------------------------',
+	'',
+	'  Usage: node ' + filename + ' [options] [file]',
+	'',
+	'  Options:',
+	'',
+	'    -V, --version       output ' + filename + ' version',
+	'    -h, --help          show usage information',
+	'',
+	'----------------------------------------------------------'
+].join('\n');
+
+//	If argument --prof_auto is received this will be set to true.
+//
+var runProfiler = false;
+
+//	Listen for datagrams on this port.
+//
+//	@see	#parseCLI
+//	@see	#startUDPListener
+//
+var udpPort		= 50000;
+
+//	Whether or not to use line numbers in printout.
+//
+var useLines 	= 1;
+
+//	Holds the reference to the timeOut used by #startMonitor.
+//	If set to false by CLI parser, no monitor will be used.
+//
+var usingMonitor = true;
+
+//	Frequency of file change checks, in milliseconds.
+//
+var	monitorFreq	= 1000;
+
+//	OS free memory
+//
+var minVMFree	= 0;
+
+//	#process#systemMemory#heapUsed
+//
+//	In bytes. When exceeded the process will reboot.
+//
+const	maxV8Heap	= 0;
+
+//	When the harnessed procedure dies, it will first send data to stderr, which we catch
+//	and report (ie. we report the error). Additionally, the process will terminate (it will
+//	emit "exit").  Normally, when we receive this message, we restart the process. If
+//	#dieOnError is sent, the process does in fact die at this point.
+//
+var dieOnError	= false;
+
+/**********************************************************************************************/
+
+								//	Harness Methods	//
+
+/**********************************************************************************************/
+
+//	Some basic colorization for terminal. TODO: in-string token parser.
+//
+var print = function(str, fg, bg) {
+
+	str = str.toString().trim()
+
+	var x;
+
+	fg	= fg || "";
+	bg	= bg || "";
+
+	var bgcolors 	= {};
+
+	//	These will be internal. TODO: parse #str to find tokens.
+	//
+	var attributes	= {
+		reset		: 0,
+		bright		: 1,
+		dim			: 2,
+		underscore	: 4,
+		blink		: 5,
+		reverse		: 7,
+		hidden		: 8
+	};
+
+	var fgcolors 	= {
+		black	: 30,
+		red		: 31,
+		green	: 32,
+		yellow	: 33,
+		blue	: 34,
+		magenta	: 35,
+		cyan	: 36,
+		white	: 37
+	}
+
+	//	Add lookup for background colors.
+	//
+	for(x in fgcolors) {
+		bgcolors[x] = fgcolors[x] + 10;
+	}
+
+	//	Will return terminal code producing foreground color reqested.
+	//
+	//	@param		{String}	c		A key present in #fgcolors map.
+	//
+	function fgCode(c) {
+		return (c in fgcolors) ? '\x1B[' + fgcolors[c] + 'm' : "";
+	}
+
+	//	Will return terminal code producing background color reqested.
+	//
+	//	@param		{String}	c		A key present in #bgcolors map.
+	//
+	function bgCode(c) {
+		return (c in bgcolors) ? '\x1B[' + bgcolors[c] + 'm' : "";
+	}
+
+	//	Will return terminal code setting attribute reqested.
+	//
+	//	@param		{String}	a		A key present in #attributes map.
+	//
+	function attribute(a) {
+		return (a in attributes) ? '\x1B[' + attributes[a] + 'm' : "";
+	}
+
+	//	[1K 		> Erase to start of line
+	//	[1000D		> Move back 1000 columns (fuzzy way of forcing to 0 column)
+	//
+	//	Encode colors and print message, resetting attributes on term.
+	//
+    str = "\x1B[1K\x1B[1000D" + (useLines ? (useLines++ + "\t ") : "") + fgCode(fg) + bgCode(bg) + str + attribute("reset");
+
+    sys.error(str.trim());
+};
+
+//	Receive and implement process boot commands.
+//
+var parseCLI = function() {
+
+	var arg;
+	var cmd;
+	var val;
+	var p;
+
+	while(args.length) {
+
+		arg		= args.shift().split("=");
+		cmd		= arg[0];
+		val		= arg[1];
+
+		switch(cmd) {
+			case '-h':
+			case '--help':
+			case '?':
+				print(manPage, "blue");
+				killNode();
+			break;
+			case '-v':
+			case '--version':
+				print("Version: " + version, "yellow", "black");
+				process.exit(0);
+			break;
+
+			case '--udpPort':
+				udpPort	= new Number(val);
+			break;
+
+			case '--prof_auto':
+				runProfiler = true;
+			break;
+
+			case '--noLineNumbers':
+				useLines = 0;
+			break;
+
+			case '--monitorFreq':
+				monitorFreq = new Number(val);
+			break;
+
+			case '--minVMFree':
+				minVMFree	= new Number(val);
+			break;
+
+			case '--disableMonitor':
+				usingMonitor	= false;
+			break;
+
+			case '--dieOnError':
+				dieOnError	= true;
+			break;
+
+			default:
+				p = path.normalize(cmd);
+				if(p === cmd) {
+					harnessFile = resolve(cmd);
+				} else {
+					print(cmd + ' [is not] a valid path.', "white", "red");
+				}
+			break;
+		}
+	}
+};
+
+
+var startMonitor = function() {
+
+	var freemem = os.freemem();
+
+	if(usingMonitor === false) {
+		return;
+	}
+
+	var memUsage;
+
+  	fs.stat(harnessFile, function(err, stat) {
+		if(new Date(stat.mtime).getTime() !== lastTouch) {
+			node && node.kill('SIGUSR2');
+		};
+  	});
+
+  	if(maxV8Heap) {
+  		memUsage = process.memoryUsage();
+		if(memUsage.heapUsed > maxV8Heap) {
+
+			print("Memory usage has exceeded #maxV8Heap( " + maxV8Heap + " ). Restarting process", "white", "red");
+
+			node && node.kill();
+		}
+	}
+
+  	if(minVMFree) {
+
+		if(pages < freemem) {
+
+			print("VM Pages Free hit #minVmPagesFree( " + freemem + " ). Current: " + pages + "/" + freemem , "white", "red");
+
+			//node && node.kill();
+		}
+
+	}
+
+	usingMonitor = setTimeout(startMonitor, monitorFreq);
+};
+
+var killNode = function(force) {
+
+	if(force) {
+		dieOnError = true;
+	}
+
+	clearTimeout(usingMonitor);
+	if(node) {
+		node.kill();
+		print("#killNode", "green", "black");
+		printTime();
+	}
+};
+
+var printTime = function() {
+	var d = new Date();
+	//	Add millseconds to date time.
+	//
+	print(d.toString().replace(/^(.*\d\d:\d\d:\d\d)(.*)$/, "$1:" + d.getMilliseconds() + "$2"), "white", "cyan");
+};
+
+var startNode = function() {
+
+	//	We do nothing if no harness file argument has been sent. This is not unusual -- we
+	//	may have received only query arguments, such as -h.
+	//
+	if(!harnessFile) {
+		return;
+	}
+
+	//	Update #lastTouch to #harnessFile's current #mtime. We're watching for changes
+	//	in #harnessFile's #mtime within #startMonitor.
+	//
+  	fs.stat(harnessFile, function(err, stat) {
+  		var nodeArgs = [harnessFile];
+  		if(!err) {
+			//	Creating the node process.
+			//
+			killNode();
+
+			if(runProfiler) {
+				//nodeArgs.unshift("--prof_auto");
+				//nodeArgs.unshift("--trace-gc");
+			}
+
+			node = spawn("node", nodeArgs);
+
+			node.stdout.on('data', function(data) {
+				print(data, "blue");
+			});
+
+			node.stderr.on('data', function(data) {
+				data = data.toString();
+				print(harnessFile + " has thrown an error:", "white", "red");
+
+				//	This is an access denied error, which is fatal. Report and suggest
+				//	permissions check.
+				//
+				if(data.indexOf("EACCES") > -1) {
+					print("!!\n\tThere has been a permissions error. You either are not authorized to start this program, or\n\tthis program is not authorized to call one or more of the services it is using.\n\tKilling program.\n\t!!", "yellow", "black");
+					killNode(true);
+				}
+
+				print(data, "white", "magenta");
+			});
+
+			//	process#kill has sent a signal.
+			//
+			node.on('exit', function (code, signal) {
+
+				printTime();
+
+				//	Show free memory
+				//
+				print("Free Memory: " + os.freemem(), "white", "red");
+
+				//	Show process memory usage
+				//
+				print("V8 Heap used: " + process.memoryUsage().heapUsed, "white", "red");
+
+				print("#received signal " + signal + " with code: " + code, "yellow", "black");
+				if(signal == 'SIGUSR2') {
+					startNode();
+				} else {
+					if(dieOnError) {
+						killNode();
+					} else {
+						startNode();
+					}
+				}
+			});
+
+			lastTouch = new Date(stat.mtime).getTime();
+			startMonitor();
+
+  			print("#startNode", "green", "black");
+			printTime();
+  			print(harnessFile, "black", "cyan");
+
+		} else {
+			print("Unable to harness file " + harnessFile, "white", "red");
+			killNode();
+			process.exit(0);
+		}
+  	});
+};
+
+//	Uses #udpPort
+//
+var startUDPListener = function() {
+
+	udpServer.on("message", function (msg, rinfo) {
+
+	console.log("HI");
+
+	  console.log("server got: " + msg + " from " +
+		rinfo.address + ":" + rinfo.port);
+	});
+
+	udpServer.on("listening", function () {
+	  var address = udpServer.address();
+	  console.log("server listening " +
+		  address.address + ":" + address.port);
+	});
+
+	udpServer.bind(udpPort);
+	// server listening 0.0.0.0:41234
+};
+
+/**********************************************************************************************/
+
+					//	Methods to catch Harness termination conditions.	//
+
+/**********************************************************************************************/
+
+//	  Try to cleanly destroy the node process.
+//
+process.on('exit', function() {
+	killNode();
+	print("Exiting process", "yellow", "black");
+});
+
+//	Usually fired when user kills the process via CTRL-C
+//
+process.on('SIGINT', function() {
+	killNode();
+	process.exit(0);
+});
+
+//	*This* file has thrown an error
+//
+process.on('uncaughtException', function (err) {
+  	print("The harness has thrown an uncaught exception:" , "white", "red");
+  	print(err, "white", "red");
+  	killNode();
+  	process.exit(0);
+});
+
+
+/**********************************************************************************************/
+
+										//	Startup	//
+
+/**********************************************************************************************/
+
+parseCLI();
+
+startNode();
+
+startUDPListener();
+
